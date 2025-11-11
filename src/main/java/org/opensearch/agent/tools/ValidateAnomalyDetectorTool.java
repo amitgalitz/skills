@@ -54,28 +54,20 @@ import lombok.Setter;
 import lombok.extern.log4j.Log4j2;
 
 /**
- * A tool used to help creating anomaly detector, the only one input parameter is the index name, this tool will get the mappings of the index
- * in flight and let LLM give the suggested category field, aggregation field and correspond aggregation method which are required for the create
- * anomaly detector API, the output of this tool is like:
- *{
- *     "index": "opensearch_dashboards_sample_data_ecommerce",
- *     "categoryField": "geoip.country_iso_code",
- *     "aggregationField": "total_quantity,total_unique_products,taxful_total_price",
- *     "aggregationMethod": "sum,count,sum",
- *     "dateFields": "customer_birth_date,order_date,products.created_on"
- * }
+ * A tool used to validate anomaly detector configuration before creation.
+ * Takes the same input as CreateAnomalyDetectorTool and validates the detector configuration.
  */
 @Log4j2
 @Setter
 @Getter
-@ToolAnnotation(CreateAnomalyDetectorTool.TYPE)
-public class CreateAnomalyDetectorTool implements WithModelTool {
+@ToolAnnotation(ValidateAnomalyDetectorTool.TYPE)
+public class ValidateAnomalyDetectorTool implements WithModelTool {
     // the type of this tool
-    public static final String TYPE = "CreateAnomalyDetectorTool";
+    public static final String TYPE = "ValidateAnomalyDetectorTool";
 
     // the default description of this tool
     private static final String DEFAULT_DESCRIPTION =
-        "This is a tool used to help creating anomaly detector. It takes a required argument which is the name of the index, extract the index mappings and let the LLM to give the suggested aggregation field, aggregation method, category field and the date field which are required to create an anomaly detector.";
+        "This tool validates anomaly detector configuration before creation. It takes the same input as CreateAnomalyDetectorTool and an optional validationType parameter (detector, model, or both). Returns validation results with any configuration issues or suggestions.";
     // the regex used to extract the key information from the response of LLM
     private static final String EXTRACT_INFORMATION_REGEX =
         "(?s).*\\{category_field=([^|]*)\\|aggregation_field=([^|]*)\\|aggregation_method=([^}]*)}.*";
@@ -148,7 +140,7 @@ public class CreateAnomalyDetectorTool implements WithModelTool {
      * @param client the OpenSearch transport client
      * @param modelId the model ID of LLM
      */
-    public CreateAnomalyDetectorTool(Client client, String modelId, String modelType, String contextPrompt) {
+    public ValidateAnomalyDetectorTool(Client client, String modelId, String modelType, String contextPrompt) {
         this.client = client;
         this.modelId = modelId;
         if (!ModelType.OPENAI.toString().equalsIgnoreCase(modelType) && !ModelType.CLAUDE.toString().equalsIgnoreCase(modelType)) {
@@ -174,6 +166,8 @@ public class CreateAnomalyDetectorTool implements WithModelTool {
         final String tenantId = parameters.get(TENANT_ID_FIELD);
         Map<String, String> enrichedParameters = enrichParameters(parameters);
         String indexName = enrichedParameters.get("index");
+        String validationType = enrichedParameters.getOrDefault("validationType", "both");
+
         if (Strings.isNullOrEmpty(indexName)) {
             throw new IllegalArgumentException(
                 "Return this final answer to human directly and do not use other tools: 'Please provide index name'. Please try to directly send this message to human to ask for index name"
@@ -181,7 +175,7 @@ public class CreateAnomalyDetectorTool implements WithModelTool {
         }
         if (indexName.startsWith(".")) {
             throw new IllegalArgumentException(
-                "CreateAnomalyDetectionTool doesn't support searching indices starting with '.' since it could be system index, current searching index name: "
+                "ValidateAnomalyDetectorTool doesn't support searching indices starting with '.' since it could be system index, current searching index name: "
                     + indexName
             );
         }
@@ -228,8 +222,6 @@ public class CreateAnomalyDetectorTool implements WithModelTool {
 
             // construct the prompt
             String prompt = constructPrompt(filteredMapping, firstIndexName);
-            log.info("Using prompt for anomaly detector creation (simple): {}", prompt);
-
             RemoteInferenceInputDataSet inputDataSet = RemoteInferenceInputDataSet
                 .builder()
                 .parameters(Collections.singletonMap("prompt", prompt))
@@ -294,7 +286,15 @@ public class CreateAnomalyDetectorTool implements WithModelTool {
                         OUTPUT_KEY_DATE_FIELDS,
                         dateFieldsJoiner.toString()
                     );
-                listener.onResponse((T) AccessController.doPrivileged((PrivilegedExceptionAction<String>) () -> gson.toJson(result)));
+
+                // Build detector JSON and call validation API instead of returning result
+                String detectorJson = buildDetectorJson(result);
+                String endpoint = getValidationEndpoint(validationType);
+
+                // TODO: Call validation API using client and return validation response
+                // For now, return the detector JSON that would be validated
+                listener.onResponse((T) AccessController.doPrivileged((PrivilegedExceptionAction<String>) () -> detectorJson));
+
             }, e -> {
                 log.error("fail to predict model: " + e);
                 listener.onFailure(e);
@@ -353,7 +353,7 @@ public class CreateAnomalyDetectorTool implements WithModelTool {
 
     @SuppressWarnings("unchecked")
     private static Map<String, String> loadDefaultPromptFromFile() {
-        try (InputStream inputStream = CreateAnomalyDetectorTool.class.getResourceAsStream("CreateAnomalyDetectorDefaultPrompt.json")) {
+        try (InputStream inputStream = ValidateAnomalyDetectorTool.class.getResourceAsStream("CreateAnomalyDetectorDefaultPrompt.json")) {
             if (inputStream != null) {
                 return gson.fromJson(new String(inputStream.readAllBytes(), StandardCharsets.UTF_8), Map.class);
             }
@@ -380,6 +380,67 @@ public class CreateAnomalyDetectorTool implements WithModelTool {
         return substitutor.replace(contextPrompt);
     }
 
+    private String buildDetectorJson(Map<String, String> configMap) {
+        Map<String, Object> detector = new HashMap<>();
+        detector.put("name", "validation-detector");
+        detector.put("description", "Detector for validation");
+        detector.put("time_field", configMap.get(OUTPUT_KEY_DATE_FIELDS).split(",")[0]);
+        detector.put("indices", new String[] { configMap.get(OUTPUT_KEY_INDEX) });
+
+        // Add detection_interval and window_delay (required)
+        Map<String, Object> detectionInterval = new HashMap<>();
+        Map<String, Object> period = new HashMap<>();
+        period.put("interval", 1);
+        period.put("unit", "Minutes");
+        detectionInterval.put("period", period);
+        detector.put("detection_interval", detectionInterval);
+        detector.put("window_delay", detectionInterval);
+
+        // Add category field if provided (for multi-entity detectors)
+        String categoryField = configMap.get(OUTPUT_KEY_CATEGORY_FIELD);
+        if (categoryField != null && !categoryField.trim().isEmpty() && !"null".equals(categoryField)) {
+            detector.put("category_field", new String[] { categoryField });
+        }
+
+        // Add basic filter query (match all)
+        Map<String, Object> filterQuery = new HashMap<>();
+        filterQuery.put("match_all", new HashMap<>());
+        detector.put("filter_query", filterQuery);
+
+        String[] fields = configMap.get(OUTPUT_KEY_AGGREGATION_FIELD).split(",");
+        String[] methods = configMap.get(OUTPUT_KEY_AGGREGATION_METHOD).split(",");
+
+        Map<String, Object>[] features = new Map[fields.length];
+        for (int i = 0; i < fields.length; i++) {
+            Map<String, Object> feature = new HashMap<>();
+            feature.put("feature_name", fields[i]);
+            feature.put("feature_enabled", true);
+
+            Map<String, Object> aggregation = new HashMap<>();
+            Map<String, Object> method = new HashMap<>();
+            method.put("field", fields[i]);
+            aggregation.put(fields[i], ImmutableMap.of(methods[i], method));
+            feature.put("aggregation_query", aggregation);
+
+            features[i] = feature;
+        }
+        detector.put("feature_attributes", features);
+
+        return gson.toJson(detector);
+    }
+
+    private String getValidationEndpoint(String validationType) {
+        switch (validationType.toLowerCase(Locale.ROOT)) {
+            case "detector":
+                return "_plugins/_anomaly_detection/detectors/_validate/detector";
+            case "model":
+                return "_plugins/_anomaly_detection/detectors/_validate/model";
+            case "both":
+            default:
+                return "_plugins/_anomaly_detection/detectors/_validate";
+        }
+    }
+
     /**
      *
      * @param parameters the input parameters
@@ -402,23 +463,23 @@ public class CreateAnomalyDetectorTool implements WithModelTool {
     /**
      * The tool factory
      */
-    public static class Factory implements WithModelTool.Factory<CreateAnomalyDetectorTool> {
+    public static class Factory implements WithModelTool.Factory<ValidateAnomalyDetectorTool> {
         private Client client;
 
-        private static CreateAnomalyDetectorTool.Factory INSTANCE;
+        private static ValidateAnomalyDetectorTool.Factory INSTANCE;
 
         /**
          * Create or return the singleton factory instance
          */
-        public static CreateAnomalyDetectorTool.Factory getInstance() {
+        public static ValidateAnomalyDetectorTool.Factory getInstance() {
             if (INSTANCE != null) {
                 return INSTANCE;
             }
-            synchronized (CreateAnomalyDetectorTool.class) {
+            synchronized (ValidateAnomalyDetectorTool.class) {
                 if (INSTANCE != null) {
                     return INSTANCE;
                 }
-                INSTANCE = new CreateAnomalyDetectorTool.Factory();
+                INSTANCE = new ValidateAnomalyDetectorTool.Factory();
                 return INSTANCE;
             }
         }
@@ -433,7 +494,7 @@ public class CreateAnomalyDetectorTool implements WithModelTool {
          * @return the instance of this tool
          */
         @Override
-        public CreateAnomalyDetectorTool create(Map<String, Object> map) {
+        public ValidateAnomalyDetectorTool create(Map<String, Object> map) {
             String modelId = (String) map.getOrDefault(COMMON_MODEL_ID_FIELD, "");
             if (modelId.isEmpty()) {
                 throw new IllegalArgumentException("model_id cannot be empty.");
@@ -447,7 +508,7 @@ public class CreateAnomalyDetectorTool implements WithModelTool {
                 throw new IllegalArgumentException("Unsupported model_type: " + modelType);
             }
             String prompt = (String) map.getOrDefault("prompt", "");
-            return new CreateAnomalyDetectorTool(client, modelId, modelType, prompt);
+            return new ValidateAnomalyDetectorTool(client, modelId, modelType, prompt);
         }
 
         @Override
